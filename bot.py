@@ -12,6 +12,7 @@ import asyncio
 import re
 import sqlite3
 from datetime import datetime
+import random
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -23,9 +24,7 @@ storage = MemoryStorage()
 # Инициализация бота
 bot = Bot(
     token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-)
-
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
 # Инициализация базы данных
@@ -58,7 +57,6 @@ def init_db():
     conn.commit()
     conn.close()
 
-# Вызовем инициализацию при старте
 init_db()
 
 # Определение состояний для FSM
@@ -69,11 +67,9 @@ class CreateForm(StatesGroup):
     waiting_for_price = State()
     confirmation = State()
 
-# Для хранения ID сообщения с предпросмотром
 preview_message_id = None
 
 def is_next_command(text: str) -> bool:
-    """Проверяет, является ли текст командой 'дальше' в любом написании"""
     return re.fullmatch(r'дальше|дпльше|далше|далее|следующий шаг|продолжить|пропустить', text.lower()) is not None
 
 # ================== ОСНОВНЫЕ КОМАНДЫ ==================
@@ -236,11 +232,10 @@ async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
     
     data = await state.get_data()
     
-    # Сохраняем анкету в базу данных
     conn = sqlite3.connect('flea_market.db')
     cursor = conn.cursor()
     
-    photos_str = str(data.get('photos', []))  # Простое преобразование списка в строку
+    photos_str = str(data.get('photos', []))
     
     cursor.execute('''
     INSERT INTO listings (user_id, title, description, photos, price, created_at)
@@ -264,7 +259,7 @@ async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
 
 <b>Что дальше?</b>
 • Вы можете просмотреть свои анкеты в разделе <b>"💼 Мои анкеты"</b>
-• Редактировать или удалить анкету там же
+• Удалить анкету там же
 
 Желаем быстрой продажи! 💰
 """
@@ -291,14 +286,17 @@ async def confirm_no(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(F.text == "🔍 Поиск объявлений")
 async def handle_search(message: types.Message):
+    await show_random_listing(message)
+
+async def show_random_listing(message: types.Message):
     conn = sqlite3.connect('flea_market.db')
     cursor = conn.cursor()
     
+    # Получаем все активные объявления, кроме собственных
     cursor.execute('''
-    SELECT id, title, description, price, user_id FROM listings 
+    SELECT id, title, description, price, photos, user_id 
+    FROM listings 
     WHERE is_active = 1 AND user_id != ?
-    ORDER BY created_at DESC
-    LIMIT 10
     ''', (message.from_user.id,))
     
     listings = cursor.fetchall()
@@ -308,48 +306,21 @@ async def handle_search(message: types.Message):
         await message.answer("🔍 Пока нет доступных объявлений. Попробуйте позже.")
         return
     
-    response = ["🔎 <b>Последние объявления</b>\n"]
-    for listing in listings:
-        id_, title, description, price, user_id = listing
-        response.append(
-            f"\n🏷 <b>Название:</b> {title}\n"
-            f"💰 <b>Цена:</b> {price} руб.\n"
-            f"👤 <b>Продавец:</b> @{user_id}\n"
-            f"📄 <b>Описание:</b> {description[:100]}...\n"
-            f"🔗 /view_{id_} - просмотреть полностью\n"
-            f"❤️ /like_{id_} - добавить в избранное"
-        )
+    # Выбираем случайное объявление
+    listing = random.choice(listings)
+    id_, title, description, price, photos_str, user_id = listing
     
-    builder = InlineKeyboardBuilder()
-    builder.add(
-        types.InlineKeyboardButton(text="🔍 Расширенный поиск", callback_data="advanced_search"),
-        types.InlineKeyboardButton(text="➡️ Показать еще", callback_data="show_more")
-    )
-    
-    await message.answer("\n".join(response), reply_markup=builder.as_markup())
-
-@dp.message(F.text.regexp(r'^/view_(\d+)$'))
-async def view_listing(message: types.Message):
-    listing_id = int(message.text.split('_')[1])
-    
+    # Проверяем, есть ли уже это объявление в избранном
     conn = sqlite3.connect('flea_market.db')
     cursor = conn.cursor()
-    
     cursor.execute('''
-    SELECT title, description, price, photos, user_id FROM listings 
-    WHERE id = ? AND is_active = 1
-    ''', (listing_id,))
-    
-    listing = cursor.fetchone()
+    SELECT 1 FROM favorites 
+    WHERE user_id = ? AND listing_id = ?
+    ''', (message.from_user.id, id_))
+    is_favorite = cursor.fetchone() is not None
     conn.close()
     
-    if not listing:
-        await message.answer("⚠️ Объявление не найдено или было удалено.")
-        return
-    
-    title, description, price, photos_str, user_id = listing
-    photos = eval(photos_str) if photos_str else []
-    
+    # Формируем сообщение
     response = (
         f"🛍 <b>{title}</b>\n\n"
         f"📄 <b>Описание:</b>\n{description}\n\n"
@@ -357,18 +328,27 @@ async def view_listing(message: types.Message):
         f"👤 <b>Продавец:</b> @{user_id}\n\n"
     )
     
+    # Создаем клавиатуру
     builder = InlineKeyboardBuilder()
-    if user_id != message.from_user.id:
-        builder.add(
-            types.InlineKeyboardButton(text="💬 Написать продавцу", url=f"tg://user?id={user_id}"),
-            types.InlineKeyboardButton(text="❤️ В избранное", callback_data=f"fav_{listing_id}")
-        )
-    else:
-        builder.add(
-            types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{listing_id}"),
-            types.InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{listing_id}")
-        )
     
+    if not is_favorite:
+        builder.add(types.InlineKeyboardButton(
+            text="❤️ Добавить в избранное",
+            callback_data=f"fav_{id_}"
+        ))
+    else:
+        builder.add(types.InlineKeyboardButton(
+            text="💔 Удалить из избранного",
+            callback_data=f"unfav_{id_}"
+        ))
+    
+    builder.add(types.InlineKeyboardButton(
+        text="➡️ Следующее объявление",
+        callback_data="next_listing"
+    ))
+    
+    # Если есть фото, отправляем их
+    photos = eval(photos_str) if photos_str else []
     if photos:
         media = []
         for i, photo_id in enumerate(photos):
@@ -378,9 +358,81 @@ async def view_listing(message: types.Message):
             ))
         
         await message.answer_media_group(media=media)
-        await message.answer("Действия с объявлением:", reply_markup=builder.as_markup())
+        await message.answer("Выберите действие:", reply_markup=builder.as_markup())
     else:
         await message.answer(response, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data == "next_listing")
+async def next_listing(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await show_random_listing(callback.message)
+
+@dp.callback_query(F.data.startswith("fav_"))
+async def add_favorite(callback: types.CallbackQuery):
+    listing_id = int(callback.data.split('_')[1])
+    
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    try:
+        cursor.execute('INSERT INTO favorites (user_id, listing_id) VALUES (?, ?)', 
+                      (callback.from_user.id, listing_id))
+        conn.commit()
+        await callback.answer("❤️ Объявление добавлено в избранное!")
+    except sqlite3.IntegrityError:
+        await callback.answer("ℹ️ Это объявление уже в вашем избранном.")
+    finally:
+        conn.close()
+    
+    # Обновляем кнопки
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        types.InlineKeyboardButton(
+            text="💔 Удалить из избранного",
+            callback_data=f"unfav_{listing_id}"
+        ),
+        types.InlineKeyboardButton(
+            text="➡️ Следующее объявление",
+            callback_data="next_listing"
+        )
+    )
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    except:
+        pass
+
+@dp.callback_query(F.data.startswith("unfav_"))
+async def remove_favorite(callback: types.CallbackQuery):
+    listing_id = int(callback.data.split('_')[1])
+    
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('DELETE FROM favorites WHERE user_id = ? AND listing_id = ?', 
+                  (callback.from_user.id, listing_id))
+    conn.commit()
+    conn.close()
+    
+    await callback.answer("💔 Объявление удалено из избранного")
+    
+    # Обновляем кнопки
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        types.InlineKeyboardButton(
+            text="❤️ Добавить в избранное",
+            callback_data=f"fav_{listing_id}"
+        ),
+        types.InlineKeyboardButton(
+            text="➡️ Следующее объявление",
+            callback_data="next_listing"
+        )
+    )
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+    except:
+        pass
 
 # ================== МОИ АНКЕТЫ ==================
 
@@ -415,15 +467,18 @@ async def handle_my(message: types.Message):
     
     builder = InlineKeyboardBuilder()
     builder.add(
-        types.InlineKeyboardButton(text="🗑 Удалить анкету", callback_data="delete_listing"),
-        types.InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_listing")
+        types.InlineKeyboardButton(text="🗑 Удалить анкету", callback_data="delete_listing")
     )
     
     await message.answer("\n".join(response), reply_markup=builder.as_markup())
 
-@dp.callback_query(F.data.startswith("delete_"))
-async def delete_listing(callback: types.CallbackQuery):
-    listing_id = int(callback.data.split('_')[1])
+@dp.callback_query(F.data == "delete_listing")
+async def delete_listing_prompt(callback: types.CallbackQuery):
+    await callback.message.answer("✏️ Введите ID анкеты, которую хотите удалить:")
+
+@dp.message(F.text.regexp(r'^\d+$'))
+async def delete_listing_by_id(message: types.Message):
+    listing_id = int(message.text)
     
     conn = sqlite3.connect('flea_market.db')
     cursor = conn.cursor()
@@ -432,18 +487,17 @@ async def delete_listing(callback: types.CallbackQuery):
     cursor.execute('SELECT user_id FROM listings WHERE id = ?', (listing_id,))
     listing = cursor.fetchone()
     
-    if not listing or listing[0] != callback.from_user.id:
-        await callback.answer("⚠️ Вы не можете удалить это объявление", show_alert=True)
+    if not listing or listing[0] != message.from_user.id:
+        await message.answer("⚠️ Вы не можете удалить это объявление")
         conn.close()
         return
     
-    # Мягкое удаление (можно сделать и DELETE)
+    # Мягкое удаление
     cursor.execute('UPDATE listings SET is_active = 0 WHERE id = ?', (listing_id,))
     conn.commit()
     conn.close()
     
-    await callback.message.edit_text("🗑 Объявление успешно удалено")
-    await callback.answer()
+    await message.answer("🗑 Объявление успешно удалено")
 
 # ================== ИЗБРАННЫЕ АНКЕТЫ ==================
 
@@ -453,7 +507,7 @@ async def handle_likes(message: types.Message):
     cursor = conn.cursor()
     
     cursor.execute('''
-    SELECT l.id, l.title, l.description, l.price 
+    SELECT l.id, l.title, l.description, l.price, l.photos, l.user_id 
     FROM listings l
     JOIN favorites f ON l.id = f.listing_id
     WHERE f.user_id = ? AND l.is_active = 1
@@ -467,69 +521,42 @@ async def handle_likes(message: types.Message):
         await message.answer("❤️ У вас пока нет избранных объявлений.")
         return
     
-    response = ["❤️ <b>Ваши избранные объявления</b>\n"]
     for listing in listings:
-        id_, title, description, price = listing
-        response.append(
-            f"\n🏷 <b>Название:</b> {title}\n"
+        id_, title, description, price, photos_str, user_id = listing
+        photos = eval(photos_str) if photos_str else []
+        
+        response = (
+            f"❤️ <b>Избранное</b>\n\n"
+            f"🏷 <b>Название:</b> {title}\n"
             f"💰 <b>Цена:</b> {price} руб.\n"
-            f"📄 <b>Описание:</b> {description[:100]}...\n"
-            f"🔗 /view_{id_} - просмотреть полностью\n"
-            f"❌ /unlike_{id_} - удалить из избранного"
+            f"👤 <b>Продавец:</b> @{user_id}\n"
+            f"📄 <b>Описание:</b>\n{description}\n\n"
         )
-    
-    await message.answer("\n".join(response))
-
-@dp.message(F.text.regexp(r'^/like_(\d+)$'))
-async def add_to_favorites(message: types.Message):
-    listing_id = int(message.text.split('_')[1])
-    
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
-    
-    # Проверяем, что объявление существует
-    cursor.execute('SELECT id FROM listings WHERE id = ? AND is_active = 1', (listing_id,))
-    if not cursor.fetchone():
-        await message.answer("⚠️ Объявление не найдено или было удалено.")
-        conn.close()
-        return
-    
-    # Проверяем, что пользователь не добавляет свое собственное объявление
-    cursor.execute('SELECT user_id FROM listings WHERE id = ?', (listing_id,))
-    listing = cursor.fetchone()
-    if listing and listing[0] == message.from_user.id:
-        await message.answer("⚠️ Вы не можете добавить в избранное свое собственное объявление.")
-        conn.close()
-        return
-    
-    # Добавляем в избранное
-    try:
-        cursor.execute('INSERT INTO favorites (user_id, listing_id) VALUES (?, ?)', 
-                      (message.from_user.id, listing_id))
-        conn.commit()
-        await message.answer("❤️ Объявление добавлено в избранное!")
-    except sqlite3.IntegrityError:
-        await message.answer("ℹ️ Это объявление уже в вашем избранном.")
-    
-    conn.close()
-
-@dp.message(F.text.regexp(r'^/unlike_(\d+)$'))
-async def remove_from_favorites(message: types.Message):
-    listing_id = int(message.text.split('_')[1])
-    
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('DELETE FROM favorites WHERE user_id = ? AND listing_id = ?', 
-                  (message.from_user.id, listing_id))
-    
-    if cursor.rowcount > 0:
-        await message.answer("🗑 Объявление удалено из избранного.")
-    else:
-        await message.answer("⚠️ Это объявление не было в вашем избранном.")
-    
-    conn.commit()
-    conn.close()
+        
+        builder = InlineKeyboardBuilder()
+        builder.add(
+            types.InlineKeyboardButton(
+                text="💬 Написать продавцу",
+                url=f"tg://user?id={user_id}"
+            ),
+            types.InlineKeyboardButton(
+                text="💔 Удалить из избранного",
+                callback_data=f"unfav_{id_}"
+            )
+        )
+        
+        if photos:
+            media = []
+            for i, photo_id in enumerate(photos):
+                media.append(types.InputMediaPhoto(
+                    media=photo_id,
+                    caption=response if i == 0 else None
+                ))
+            
+            await message.answer_media_group(media=media)
+            await message.answer("Действия с объявлением:", reply_markup=builder.as_markup())
+        else:
+            await message.answer(response, reply_markup=builder.as_markup())
 
 # ================== ЗАГЛУШКИ ==================
 
