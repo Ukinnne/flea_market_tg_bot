@@ -10,13 +10,17 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import re
+import sqlite3
+from datetime import datetime
 
+# Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Initialize storage
+# Инициализация хранилища
 storage = MemoryStorage()
 
+# Инициализация бота
 bot = Bot(
     token=BOT_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -24,7 +28,40 @@ bot = Bot(
 
 dp = Dispatcher(storage=storage)
 
-# Define states for FSM
+# Инициализация базы данных
+def init_db():
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS listings (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL,
+        photos TEXT,
+        price INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        is_active INTEGER DEFAULT 1
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS favorites (
+        user_id INTEGER NOT NULL,
+        listing_id INTEGER NOT NULL,
+        PRIMARY KEY (user_id, listing_id),
+        FOREIGN KEY (listing_id) REFERENCES listings (id) ON DELETE CASCADE
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Вызовем инициализацию при старте
+init_db()
+
+# Определение состояний для FSM
 class CreateForm(StatesGroup):
     waiting_for_title = State()
     waiting_for_description = State()
@@ -38,6 +75,8 @@ preview_message_id = None
 def is_next_command(text: str) -> bool:
     """Проверяет, является ли текст командой 'дальше' в любом написании"""
     return re.fullmatch(r'дальше|дпльше|далше|далее|следующий шаг|продолжить|пропустить', text.lower()) is not None
+
+# ================== ОСНОВНЫЕ КОМАНДЫ ==================
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -71,9 +110,31 @@ async def start(message: types.Message):
 """
     await message.answer(welcome_message, reply_markup=builder.as_markup(resize_keyboard=True))
 
-@dp.message(F.text == "🔍 Поиск объявлений")
-async def handle_search(message: types.Message):
-    await message.answer("🔎 <b>Давайте найдем что-то интересное!</b>\n\nЗдесь будут отображаться все доступные объявления от других пользователей.")
+@dp.message(Command("help"))
+async def help_command(message: types.Message):
+    help_text = """
+🆘 <b>Помощь по использованию бота</b> 🆘
+
+<b>Основные команды:</b>
+/start - Начать работу с ботом
+/help - Получить справку
+
+<b>Как создать анкету?</b>
+1. Нажмите "📝 Создать анкету"
+2. Следуйте пошаговым инструкциям
+3. Проверьте информацию и подтвердите создание
+
+<b>Как купить товар?</b>
+1. Найдите нужный товар через "🔍 Поиск объявлений"
+2. Свяжитесь с продавцом
+3. Договоритесь об условиях сделки
+
+<b>Вопросы и поддержка:</b>
+Если у вас возникли проблемы, напишите нам: @Ukinnne
+"""
+    await message.answer(help_text)
+
+# ================== СОЗДАНИЕ АНКЕТЫ ==================
 
 @dp.message(F.text == "📝 Создать анкету")
 async def handle_create(message: types.Message, state: FSMContext):
@@ -173,6 +234,29 @@ async def delete_preview_message(chat_id: int):
 async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
     await delete_preview_message(callback.message.chat.id)
     
+    data = await state.get_data()
+    
+    # Сохраняем анкету в базу данных
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    photos_str = str(data.get('photos', []))  # Простое преобразование списка в строку
+    
+    cursor.execute('''
+    INSERT INTO listings (user_id, title, description, photos, price, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ''', (
+        callback.from_user.id,
+        data['title'],
+        data['description'],
+        photos_str,
+        data['price'],
+        datetime.now().isoformat()
+    ))
+    
+    conn.commit()
+    conn.close()
+    
     success_message = """
 🎉 <b>Анкета успешно создана!</b> 🎉
 
@@ -203,41 +287,257 @@ async def confirm_no(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.answer()
 
+# ================== ПОИСК И ПРОСМОТР АНКЕТ ==================
+
+@dp.message(F.text == "🔍 Поиск объявлений")
+async def handle_search(message: types.Message):
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT id, title, description, price, user_id FROM listings 
+    WHERE is_active = 1 AND user_id != ?
+    ORDER BY created_at DESC
+    LIMIT 10
+    ''', (message.from_user.id,))
+    
+    listings = cursor.fetchall()
+    conn.close()
+    
+    if not listings:
+        await message.answer("🔍 Пока нет доступных объявлений. Попробуйте позже.")
+        return
+    
+    response = ["🔎 <b>Последние объявления</b>\n"]
+    for listing in listings:
+        id_, title, description, price, user_id = listing
+        response.append(
+            f"\n🏷 <b>Название:</b> {title}\n"
+            f"💰 <b>Цена:</b> {price} руб.\n"
+            f"👤 <b>Продавец:</b> @{user_id}\n"
+            f"📄 <b>Описание:</b> {description[:100]}...\n"
+            f"🔗 /view_{id_} - просмотреть полностью\n"
+            f"❤️ /like_{id_} - добавить в избранное"
+        )
+    
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        types.InlineKeyboardButton(text="🔍 Расширенный поиск", callback_data="advanced_search"),
+        types.InlineKeyboardButton(text="➡️ Показать еще", callback_data="show_more")
+    )
+    
+    await message.answer("\n".join(response), reply_markup=builder.as_markup())
+
+@dp.message(F.text.regexp(r'^/view_(\d+)$'))
+async def view_listing(message: types.Message):
+    listing_id = int(message.text.split('_')[1])
+    
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT title, description, price, photos, user_id FROM listings 
+    WHERE id = ? AND is_active = 1
+    ''', (listing_id,))
+    
+    listing = cursor.fetchone()
+    conn.close()
+    
+    if not listing:
+        await message.answer("⚠️ Объявление не найдено или было удалено.")
+        return
+    
+    title, description, price, photos_str, user_id = listing
+    photos = eval(photos_str) if photos_str else []
+    
+    response = (
+        f"🛍 <b>{title}</b>\n\n"
+        f"📄 <b>Описание:</b>\n{description}\n\n"
+        f"💰 <b>Цена:</b> {price} руб.\n"
+        f"👤 <b>Продавец:</b> @{user_id}\n\n"
+    )
+    
+    builder = InlineKeyboardBuilder()
+    if user_id != message.from_user.id:
+        builder.add(
+            types.InlineKeyboardButton(text="💬 Написать продавцу", url=f"tg://user?id={user_id}"),
+            types.InlineKeyboardButton(text="❤️ В избранное", callback_data=f"fav_{listing_id}")
+        )
+    else:
+        builder.add(
+            types.InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"edit_{listing_id}"),
+            types.InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delete_{listing_id}")
+        )
+    
+    if photos:
+        media = []
+        for i, photo_id in enumerate(photos):
+            media.append(types.InputMediaPhoto(
+                media=photo_id,
+                caption=response if i == 0 else None
+            ))
+        
+        await message.answer_media_group(media=media)
+        await message.answer("Действия с объявлением:", reply_markup=builder.as_markup())
+    else:
+        await message.answer(response, reply_markup=builder.as_markup())
+
+# ================== МОИ АНКЕТЫ ==================
+
 @dp.message(F.text == "💼 Мои анкеты")
 async def handle_my(message: types.Message):
-    await message.answer("📂 <b>Ваши анкеты</b>\n\nЗдесь будут отображаться все созданные вами объявления.")
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT id, title, description, price FROM listings 
+    WHERE user_id = ? AND is_active = 1
+    ORDER BY created_at DESC
+    ''', (message.from_user.id,))
+    
+    listings = cursor.fetchall()
+    conn.close()
+    
+    if not listings:
+        await message.answer("📭 У вас пока нет активных анкет.")
+        return
+    
+    response = ["📂 <b>Ваши анкеты</b>\n"]
+    for listing in listings:
+        id_, title, description, price = listing
+        response.append(
+            f"\n🆔 <b>ID:</b> {id_}\n"
+            f"🏷 <b>Название:</b> {title}\n"
+            f"💰 <b>Цена:</b> {price} руб.\n"
+            f"📄 <b>Описание:</b> {description[:100]}...\n"
+            f"🔗 /view_{id_} - просмотреть полностью"
+        )
+    
+    builder = InlineKeyboardBuilder()
+    builder.add(
+        types.InlineKeyboardButton(text="🗑 Удалить анкету", callback_data="delete_listing"),
+        types.InlineKeyboardButton(text="✏️ Редактировать", callback_data="edit_listing")
+    )
+    
+    await message.answer("\n".join(response), reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("delete_"))
+async def delete_listing(callback: types.CallbackQuery):
+    listing_id = int(callback.data.split('_')[1])
+    
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    # Проверяем, что пользователь является владельцем
+    cursor.execute('SELECT user_id FROM listings WHERE id = ?', (listing_id,))
+    listing = cursor.fetchone()
+    
+    if not listing or listing[0] != callback.from_user.id:
+        await callback.answer("⚠️ Вы не можете удалить это объявление", show_alert=True)
+        conn.close()
+        return
+    
+    # Мягкое удаление (можно сделать и DELETE)
+    cursor.execute('UPDATE listings SET is_active = 0 WHERE id = ?', (listing_id,))
+    conn.commit()
+    conn.close()
+    
+    await callback.message.edit_text("🗑 Объявление успешно удалено")
+    await callback.answer()
+
+# ================== ИЗБРАННЫЕ АНКЕТЫ ==================
+
+@dp.message(F.text == "♥️ Избранные анкеты")
+async def handle_likes(message: types.Message):
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    SELECT l.id, l.title, l.description, l.price 
+    FROM listings l
+    JOIN favorites f ON l.id = f.listing_id
+    WHERE f.user_id = ? AND l.is_active = 1
+    ORDER BY l.created_at DESC
+    ''', (message.from_user.id,))
+    
+    listings = cursor.fetchall()
+    conn.close()
+    
+    if not listings:
+        await message.answer("❤️ У вас пока нет избранных объявлений.")
+        return
+    
+    response = ["❤️ <b>Ваши избранные объявления</b>\n"]
+    for listing in listings:
+        id_, title, description, price = listing
+        response.append(
+            f"\n🏷 <b>Название:</b> {title}\n"
+            f"💰 <b>Цена:</b> {price} руб.\n"
+            f"📄 <b>Описание:</b> {description[:100]}...\n"
+            f"🔗 /view_{id_} - просмотреть полностью\n"
+            f"❌ /unlike_{id_} - удалить из избранного"
+        )
+    
+    await message.answer("\n".join(response))
+
+@dp.message(F.text.regexp(r'^/like_(\d+)$'))
+async def add_to_favorites(message: types.Message):
+    listing_id = int(message.text.split('_')[1])
+    
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    # Проверяем, что объявление существует
+    cursor.execute('SELECT id FROM listings WHERE id = ? AND is_active = 1', (listing_id,))
+    if not cursor.fetchone():
+        await message.answer("⚠️ Объявление не найдено или было удалено.")
+        conn.close()
+        return
+    
+    # Проверяем, что пользователь не добавляет свое собственное объявление
+    cursor.execute('SELECT user_id FROM listings WHERE id = ?', (listing_id,))
+    listing = cursor.fetchone()
+    if listing and listing[0] == message.from_user.id:
+        await message.answer("⚠️ Вы не можете добавить в избранное свое собственное объявление.")
+        conn.close()
+        return
+    
+    # Добавляем в избранное
+    try:
+        cursor.execute('INSERT INTO favorites (user_id, listing_id) VALUES (?, ?)', 
+                      (message.from_user.id, listing_id))
+        conn.commit()
+        await message.answer("❤️ Объявление добавлено в избранное!")
+    except sqlite3.IntegrityError:
+        await message.answer("ℹ️ Это объявление уже в вашем избранном.")
+    
+    conn.close()
+
+@dp.message(F.text.regexp(r'^/unlike_(\d+)$'))
+async def remove_from_favorites(message: types.Message):
+    listing_id = int(message.text.split('_')[1])
+    
+    conn = sqlite3.connect('flea_market.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('DELETE FROM favorites WHERE user_id = ? AND listing_id = ?', 
+                  (message.from_user.id, listing_id))
+    
+    if cursor.rowcount > 0:
+        await message.answer("🗑 Объявление удалено из избранного.")
+    else:
+        await message.answer("⚠️ Это объявление не было в вашем избранном.")
+    
+    conn.commit()
+    conn.close()
+
+# ================== ЗАГЛУШКИ ==================
 
 @dp.message(F.text == "🕑 История покупок")
 async def handle_history(message: types.Message):
     await message.answer("🛒 <b>История покупок</b>\n\nВ этом разделе вы можете просмотреть все ваши завершенные сделки.")
 
-@dp.message(F.text == "♥️ Избранные анкеты")
-async def handle_likes(message: types.Message):
-    await message.answer("❤️ <b>Избранные анкеты</b>\n\nЗдесь сохраняются все понравившиеся вам предложения.")
-
-@dp.message(Command("help"))
-async def help_command(message: types.Message):
-    help_text = """
-🆘 <b>Помощь по использованию бота</b> 🆘
-
-<b>Основные команды:</b>
-/start - Начать работу с ботом
-/help - Получить справку
-
-<b>Как создать анкету?</b>
-1. Нажмите "📝 Создать анкету"
-2. Следуйте пошаговым инструкциям
-3. Проверьте информацию и подтвердите создание
-
-<b>Как купить товар?</b>
-1. Найдите нужный товар через "🔍 Поиск объявлений"
-2. Свяжитесь с продавцом
-3. Договоритесь об условиях сделки
-
-<b>Вопросы и поддержка:</b>
-Если у вас возникли проблемы, напишите нам: @Ukinnne
-"""
-    await message.answer(help_text)
+# ================== ЗАПУСК БОТА ==================
 
 async def main():
     await dp.start_polling(bot)
