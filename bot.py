@@ -9,6 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
 import os
 import asyncio
+import re
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -31,8 +32,12 @@ class CreateForm(StatesGroup):
     waiting_for_price = State()
     confirmation = State()
 
-# Store message IDs to delete them later
-user_message_history = {}
+# Для хранения ID сообщения с предпросмотром
+preview_message_id = None
+
+def is_next_command(text: str) -> bool:
+    """Проверяет, является ли текст командой 'дальше' в любом написании"""
+    return re.fullmatch(r'дальше|дпльше|далше|далее|следующий шаг|продолжить|пропустить', text.lower()) is not None
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
@@ -73,69 +78,58 @@ async def handle_search(message: types.Message):
 @dp.message(F.text == "📝 Создать анкету")
 async def handle_create(message: types.Message, state: FSMContext):
     await state.set_state(CreateForm.waiting_for_title)
-    user_message_history[message.from_user.id] = [message.message_id]
-    
-    msg = await message.answer("🛍️ <b>Создание новой анкеты</b>\n\n📛 <b>Шаг 1 из 4</b>\n\nПридумайте <b>яркое название</b> для вашего товара:\n\n<code>Пример: \"Крутой велосипед GT Aggressor\"</code>")
-    user_message_history[message.from_user.id].append(msg.message_id)
+    await message.answer("🛍️ <b>Создание новой анкеты</b>\n\n📛 <b>Шаг 1 из 4</b>\n\nПридумайте <b>яркое название</b> для вашего товара:\n\n<code>Пример: \"Крутой велосипед GT Aggressor\"</code>")
 
 @dp.message(CreateForm.waiting_for_title)
 async def process_title(message: types.Message, state: FSMContext):
-    user_message_history[message.from_user.id].append(message.message_id)
-    data = await state.get_data()
-    data['title'] = message.text
-    await state.set_data(data)
+    await state.update_data(title=message.text)
     await state.set_state(CreateForm.waiting_for_description)
-    
-    msg = await message.answer("📝 <b>Шаг 2 из 4</b>\n\nНапишите <b>подробное описание</b> вашего товара:\n\n<code>Пример: \"Велосипед в отличном состоянии, 2021 год выпуска. Все компоненты работают идеально, пробег менее 500 км.\"</code>")
-    user_message_history[message.from_user.id].append(msg.message_id)
+    await message.answer("📝 <b>Шаг 2 из 4</b>\n\nНапишите <b>подробное описание</b> вашего товара:\n\n<code>Пример: \"Велосипед в отличном состоянии, 2021 год выпуска. Все компоненты работают идеально, пробег менее 500 км.\"</code>")
 
 @dp.message(CreateForm.waiting_for_description)
 async def process_description(message: types.Message, state: FSMContext):
-    user_message_history[message.from_user.id].append(message.message_id)
-    data = await state.get_data()
-    data['description'] = message.text
-    await state.set_data(data)
+    await state.update_data(description=message.text)
     await state.set_state(CreateForm.waiting_for_photos)
-    
-    msg = await message.answer("📸 <b>Шаг 3 из 4</b>\n\nПришлите <b>до 3 фотографий</b> вашего товара (чем больше, тем лучше!):\n\nИли напишите <b>\"Дальше\"</b>, если фотографий нет")
-    user_message_history[message.from_user.id].append(msg.message_id)
+    await message.answer("📸 <b>Шаг 3 из 4</b>\n\nПришлите <b>до 3 фотографий</b> вашего товара (чем больше, тем лучше!):\n\nИли напишите <b>\"Дальше\"</b> (можно в любом написании), если фотографий нет")
 
-@dp.message(CreateForm.waiting_for_photos, F.text == "Дальше")
-async def skip_photos(message: types.Message, state: FSMContext):
-    user_message_history[message.from_user.id].append(message.message_id)
-    await state.set_state(CreateForm.waiting_for_price)
-    
-    msg = await message.answer("💰 <b>Финальный шаг!</b>\n\nУкажите <b>цену</b> вашего товара в рублях:\n\n<code>Пример: 15000</code>")
-    user_message_history[message.from_user.id].append(msg.message_id)
+@dp.message(CreateForm.waiting_for_photos, F.text)
+async def handle_text_during_photos(message: types.Message, state: FSMContext):
+    if is_next_command(message.text):
+        await state.set_state(CreateForm.waiting_for_price)
+        await message.answer("💰 <b>Финальный шаг!</b>\n\nУкажите <b>цену</b> вашего товара в рублях (только цифры):\n\n<code>Пример: 15000</code>")
+    else:
+        await message.answer("📸 Вы находитесь на этапе загрузки фотографий.\n\nОтправьте до 3 фото или напишите <b>\"Дальше\"</b> (можно в любом написании), чтобы пропустить этот шаг.")
 
 @dp.message(CreateForm.waiting_for_photos, F.photo)
 async def process_photos(message: types.Message, state: FSMContext):
-    user_message_history[message.from_user.id].append(message.message_id)
     data = await state.get_data()
-    if len(data.get('photos', [])) < 3:
-        if 'photos' not in data:
-            data['photos'] = []
-        data['photos'].append(message.photo[-1].file_id)
-        await state.set_data(data)
+    photos = data.get('photos', [])
+    
+    if len(photos) < 3:
+        photos.append(message.photo[-1].file_id)
+        await state.update_data(photos=photos)
         
-        if len(data['photos']) < 3:
-            msg = await message.answer(f"📸 Фото {len(data['photos'])}/3 получено!\n\nМожете отправить еще фото или написать <b>\"Дальше\"</b>")
-            user_message_history[message.from_user.id].append(msg.message_id)
+        if len(photos) < 3:
+            await message.answer(f"📸 Фото {len(photos)}/3 получено!\n\nМожете отправить еще фото или написать <b>\"Дальше\"</b> (можно в любом написании)")
         else:
             await state.set_state(CreateForm.waiting_for_price)
-            msg = await message.answer("✅ <b>Максимальное количество фото получено!</b>\n\nТеперь укажите <b>цену</b> вашего товара в рублях:")
-            user_message_history[message.from_user.id].append(msg.message_id)
+            await message.answer("✅ <b>Максимальное количество фото получено!</b>\n\nТеперь укажите <b>цену</b> вашего товара в рублях (только цифры):")
     else:
-        msg = await message.answer("⚠️ Вы уже отправили максимальное количество фото (3). Переходим к указанию цены.")
-        user_message_history[message.from_user.id].append(msg.message_id)
+        await message.answer("⚠️ Вы уже отправили максимальное количество фото (3). Переходим к указанию цены.")
 
 @dp.message(CreateForm.waiting_for_price, F.text.regexp(r'^\d+$'))
-async def process_price(message: types.Message, state: FSMContext):
-    user_message_history[message.from_user.id].append(message.message_id)
-    data = await state.get_data()
-    data['price'] = int(message.text)
-    await state.set_data(data)
+async def process_price_valid(message: types.Message, state: FSMContext):
+    await state.update_data(price=int(message.text))
     await state.set_state(CreateForm.confirmation)
+    await show_preview(message, state)
+
+@dp.message(CreateForm.waiting_for_price)
+async def process_price_invalid(message: types.Message):
+    await message.answer("⚠️ Пожалуйста, введите цену только цифрами (без букв, пробелов и других символов).\n\nПример: <code>15000</code>")
+
+async def show_preview(message: types.Message, state: FSMContext):
+    global preview_message_id
+    data = await state.get_data()
     
     preview_text = (
         "🛒 <b>ПРЕДПРОСМОТР АНКЕТЫ</b> 🛒\n\n"
@@ -161,23 +155,23 @@ async def process_price(message: types.Message, state: FSMContext):
         
         await message.answer_media_group(media=media)
         msg = await message.answer("Подтвердите создание анкеты:", reply_markup=builder.as_markup())
-        user_message_history[message.from_user.id].append(msg.message_id)
+        preview_message_id = msg.message_id
     else:
         msg = await message.answer(preview_text, reply_markup=builder.as_markup())
-        user_message_history[message.from_user.id].append(msg.message_id)
+        preview_message_id = msg.message_id
 
-async def delete_previous_messages(user_id: int, chat_id: int):
-    if user_id in user_message_history:
-        for msg_id in user_message_history[user_id]:
-            try:
-                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
-            except:
-                pass
-        del user_message_history[user_id]
+async def delete_preview_message(chat_id: int):
+    global preview_message_id
+    if preview_message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=preview_message_id)
+        except:
+            pass
+        preview_message_id = None
 
 @dp.callback_query(CreateForm.confirmation, F.data == "confirm_yes")
 async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
-    await delete_previous_messages(callback.from_user.id, callback.message.chat.id)
+    await delete_preview_message(callback.message.chat.id)
     
     success_message = """
 🎉 <b>Анкета успешно создана!</b> 🎉
@@ -196,7 +190,7 @@ async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(CreateForm.confirmation, F.data == "confirm_no")
 async def confirm_no(callback: types.CallbackQuery, state: FSMContext):
-    await delete_previous_messages(callback.from_user.id, callback.message.chat.id)
+    await delete_preview_message(callback.message.chat.id)
     
     cancel_message = """
 🛑 <b>Создание анкеты отменено</b> 🛑
