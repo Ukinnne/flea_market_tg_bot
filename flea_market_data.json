@@ -1,0 +1,26 @@
+{
+  "listings": {
+    "202506080706307223": {
+      "id": "202506080706307223",
+      "user_id": 1195158333,
+      "title": "Ыыы",
+      "description": "Пример: \"Велосипед в отличном состоянии, 2021 год выпуска. Все компоненты работают идеально, пробег менее 500 км.\"",
+      "photos": [
+        "AgACAgIAAxkBAAICK2hEpX2jKsIZNiEIAUjKuynDYqqIAAJa8TEbw33xSZJ1Lhb-2uS8AQADAgADeQADNgQ",
+        "AgACAgIAAxkBAAICLGhEpX2DQJFmGVM8Oy9FjqPwXFcJAAJs9TEbgsgpSt-EYHt0v_O7AQADAgADeQADNgQ",
+        "AgACAgIAAxkBAAICLWhEpX2_uTLBgDhXuOai6BtGt7HgAALk8DEbpEjZSOiUODbT0lwOAQADAgADeQADNgQ"
+      ],
+      "price": 5242,
+      "created_at": "2025-06-08T07:06:30.263344",
+      "is_active": true
+    }
+  },
+  "user_histories": {
+    "6369429925": {
+      "viewed_ids": [
+        "202506080706307223"
+      ],
+      "favorites": []
+    }
+  }
+}

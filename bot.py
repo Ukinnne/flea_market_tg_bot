@@ -1,3 +1,11 @@
+import os
+import asyncio
+import re
+import json
+from datetime import datetime
+import random
+from typing import Dict, List, Optional
+from dataclasses import dataclass, asdict
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
@@ -7,68 +15,147 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from dotenv import load_dotenv
-import os
-import asyncio
-import re
-import sqlite3
-from datetime import datetime
-import random
 
 # Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# Инициализация хранилища
-storage = MemoryStorage()
-
 # Инициализация бота
-bot = Bot(
-    token=BOT_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=storage)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
 
-# Инициализация базы данных
-def init_db():
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS listings (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        title TEXT NOT NULL,
-        description TEXT NOT NULL,
-        photos TEXT,
-        price INTEGER NOT NULL,
-        created_at TEXT NOT NULL,
-        is_active INTEGER DEFAULT 1
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS favorites (
-        user_id INTEGER NOT NULL,
-        listing_id INTEGER NOT NULL,
-        PRIMARY KEY (user_id, listing_id),
-        FOREIGN KEY (listing_id) REFERENCES listings (id) ON DELETE CASCADE
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS viewed_listings (
-        user_id INTEGER NOT NULL,
-        listing_id INTEGER NOT NULL,
-        viewed INTEGER DEFAULT 0,
-        PRIMARY KEY (user_id, listing_id)
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
+# ================== МОДЕЛИ ДАННЫХ И ХРАНИЛИЩЕ ==================
 
-init_db()
+@dataclass
+class Listing:
+    id: str
+    user_id: int
+    title: str
+    description: str
+    photos: List[str]
+    price: int
+    created_at: str
+    is_active: bool = True
 
-# Определение состояний для FSM
+@dataclass
+class UserViewHistory:
+    user_id: int
+    viewed_ids: List[str]
+    favorites: List[str]
+
+class JSONStorage:
+    def __init__(self, file_path: str = "flea_market_data.json"):
+        self.file_path = file_path
+        self.listings: Dict[str, Listing] = {}
+        self.user_histories: Dict[int, UserViewHistory] = {}
+        self.load_data()
+
+    def load_data(self):
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.listings = {k: Listing(**v) for k, v in data.get("listings", {}).items()}
+                self.user_histories = {
+                    int(k): UserViewHistory(
+                        user_id=int(k),
+                        viewed_ids=v.get("viewed_ids", []),
+                        favorites=v.get("favorites", [])
+                    )
+                    for k, v in data.get("user_histories", {}).items()
+                }
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.listings = {}
+            self.user_histories = {}
+
+    def save_data(self):
+        data = {
+            "listings": {k: asdict(v) for k, v in self.listings.items()},
+            "user_histories": {
+                str(k): {
+                    "viewed_ids": v.viewed_ids,
+                    "favorites": v.favorites
+                }
+                for k, v in self.user_histories.items()
+            }
+        }
+        with open(self.file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def get_user_history(self, user_id: int) -> UserViewHistory:
+        if user_id not in self.user_histories:
+            self.user_histories[user_id] = UserViewHistory(
+                user_id=user_id,
+                viewed_ids=[],
+                favorites=[]
+            )
+        return self.user_histories[user_id]
+
+    def add_listing(self, listing: Listing):
+        self.listings[listing.id] = listing
+        self.save_data()
+
+    def get_listing(self, listing_id: str) -> Optional[Listing]:
+        return self.listings.get(listing_id)
+
+    def get_user_listings(self, user_id: int) -> List[Listing]:
+        return [
+            listing for listing in self.listings.values() 
+            if listing.user_id == user_id and listing.is_active
+        ]
+
+    def get_active_listings(self, exclude_user_id: int) -> List[Listing]:
+        return [
+            listing for listing in self.listings.values()
+            if listing.is_active and listing.user_id != exclude_user_id
+        ]
+
+    def mark_as_viewed(self, user_id: int, listing_id: str):
+        history = self.get_user_history(user_id)
+        if listing_id not in history.viewed_ids:
+            history.viewed_ids.append(listing_id)
+        self.save_data()
+
+    def reset_viewed(self, user_id: int):
+        history = self.get_user_history(user_id)
+        history.viewed_ids = []
+        self.save_data()
+
+    def add_to_favorites(self, user_id: int, listing_id: str):
+        history = self.get_user_history(user_id)
+        if listing_id not in history.favorites:
+            history.favorites.append(listing_id)
+        self.save_data()
+
+    def remove_from_favorites(self, user_id: int, listing_id: str):
+        history = self.get_user_history(user_id)
+        if listing_id in history.favorites:
+            history.favorites.remove(listing_id)
+        self.save_data()
+
+    def get_favorites(self, user_id: int) -> List[Listing]:
+        history = self.get_user_history(user_id)
+        return [
+            listing for listing_id in history.favorites
+            if (listing := self.get_listing(listing_id)) is not None and listing.is_active
+        ]
+
+    def deactivate_listing(self, listing_id: str, user_id: int):
+        listing = self.get_listing(listing_id)
+        if listing and listing.user_id == user_id:
+            listing.is_active = False
+            self.save_data()
+            return True
+        return False
+
+# Инициализация хранилища
+storage = JSONStorage()
+
+# Генерация ID для объявлений
+def generate_id() -> str:
+    return datetime.now().strftime("%Y%m%d%H%M%S") + str(random.randint(1000, 9999))
+
+# ================== СОСТОЯНИЯ FSM ==================
+
 class CreateForm(StatesGroup):
     waiting_for_title = State()
     waiting_for_description = State()
@@ -185,9 +272,16 @@ async def process_photos(message: types.Message, state: FSMContext):
 
 @dp.message(CreateForm.waiting_for_price, F.text.regexp(r'^\d+$'))
 async def process_price_valid(message: types.Message, state: FSMContext):
-    await state.update_data(price=int(message.text))
-    await state.set_state(CreateForm.confirmation)
-    await show_preview(message, state)
+    try:
+        price = int(message.text)
+        if price > 2**63 - 1:  # Максимальное значение для SQLite INTEGER
+            await message.answer("⚠️ Слишком большая цена. Пожалуйста, введите меньшую сумму.")
+            return
+        await state.update_data(price=price)
+        await state.set_state(CreateForm.confirmation)
+        await show_preview(message, state)
+    except ValueError:
+        await message.answer("⚠️ Пожалуйста, введите корректную цену (только цифры).")
 
 @dp.message(CreateForm.waiting_for_price)
 async def process_price_invalid(message: types.Message):
@@ -241,25 +335,19 @@ async def confirm_yes(callback: types.CallbackQuery, state: FSMContext):
     
     data = await state.get_data()
     
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
+    # Создаем новое объявление
+    new_listing = Listing(
+        id=generate_id(),
+        user_id=callback.from_user.id,
+        title=data['title'],
+        description=data['description'],
+        photos=data.get('photos', []),
+        price=data['price'],
+        created_at=datetime.now().isoformat()
+    )
     
-    photos_str = str(data.get('photos', []))
-    
-    cursor.execute('''
-    INSERT INTO listings (user_id, title, description, photos, price, created_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ''', (
-        callback.from_user.id,
-        data['title'],
-        data['description'],
-        photos_str,
-        data['price'],
-        datetime.now().isoformat()
-    ))
-    
-    conn.commit()
-    conn.close()
+    # Сохраняем в хранилище
+    storage.add_listing(new_listing)
     
     success_message = """
 🎉 <b>Анкета успешно создана!</b> 🎉
@@ -298,74 +386,43 @@ async def handle_search(message: types.Message):
     await show_random_listing(message)
 
 async def show_random_listing(message: types.Message):
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
+    # Получаем все активные объявления, кроме собственных
+    all_listings = storage.get_active_listings(message.from_user.id)
     
-    # Получаем все активные объявления, кроме собственных и уже просмотренных
-    cursor.execute('''
-    SELECT l.id, l.title, l.description, l.price, l.photos, l.user_id 
-    FROM listings l
-    LEFT JOIN viewed_listings vl ON l.id = vl.listing_id AND vl.user_id = ?
-    WHERE l.is_active = 1 
-    AND l.user_id != ?
-    AND (vl.viewed IS NULL OR vl.viewed = 0)
-    ''', (message.from_user.id, message.from_user.id))
+    if not all_listings:
+        await message.answer("🔍 Пока нет доступных объявлений. Попробуйте позже.")
+        return
     
-    available_listings = cursor.fetchall()
+    # Получаем историю просмотров пользователя
+    user_history = storage.get_user_history(message.from_user.id)
+    
+    # Исключаем уже просмотренные объявления
+    available_listings = [
+        listing for listing in all_listings
+        if listing.id not in user_history.viewed_ids
+    ]
     
     if not available_listings:
-        # Если нет непросмотренных объявлений, сбрасываем статус просмотров
-        cursor.execute('''
-        UPDATE viewed_listings 
-        SET viewed = 0 
-        WHERE user_id = ?
-        ''', (message.from_user.id,))
-        conn.commit()
-        
-        # Повторно пытаемся получить объявления
-        cursor.execute('''
-        SELECT l.id, l.title, l.description, l.price, l.photos, l.user_id 
-        FROM listings l
-        LEFT JOIN viewed_listings vl ON l.id = vl.listing_id AND vl.user_id = ?
-        WHERE l.is_active = 1 
-        AND l.user_id != ?
-        AND (vl.viewed IS NULL OR vl.viewed = 0)
-        ''', (message.from_user.id, message.from_user.id))
-        
-        available_listings = cursor.fetchall()
-        
-        if not available_listings:
-            conn.close()
-            await message.answer("🔍 На данный момент нет новых объявлений. Попробуйте позже.")
-            return
-        else:
-            await message.answer("🔄 Вы просмотрели все объявления. Начинаем показ заново.")
+        # Если все просмотрены, сбрасываем историю
+        storage.reset_viewed(message.from_user.id)
+        available_listings = all_listings
+        await message.answer("🔄 Вы просмотрели все объявления. Начинаем показ заново.")
     
-    # Выбираем случайное объявление из доступных
+    # Выбираем случайное объявление
     listing = random.choice(available_listings)
-    id_, title, description, price, photos_str, user_id = listing
     
-    # Помечаем объявление как просмотренное
-    cursor.execute('''
-    INSERT OR REPLACE INTO viewed_listings (user_id, listing_id, viewed)
-    VALUES (?, ?, 1)
-    ''', (message.from_user.id, id_))
-    conn.commit()
+    # Помечаем как просмотренное
+    storage.mark_as_viewed(message.from_user.id, listing.id)
     
-    # Проверяем, есть ли уже это объявление в избранном
-    cursor.execute('''
-    SELECT 1 FROM favorites 
-    WHERE user_id = ? AND listing_id = ?
-    ''', (message.from_user.id, id_))
-    is_favorite = cursor.fetchone() is not None
-    conn.close()
+    # Проверяем, есть ли в избранном
+    is_favorite = listing.id in storage.get_user_history(message.from_user.id).favorites
     
     # Формируем сообщение
     response = (
-        f"🛍 <b>{title}</b>\n\n"
-        f"📄 <b>Описание:</b>\n{description}\n\n"
-        f"💰 <b>Цена:</b> {price} руб.\n"
-        f"👤 <b>Продавец:</b> @{user_id}\n\n"
+        f"🛍 <b>{listing.title}</b>\n\n"
+        f"📄 <b>Описание:</b>\n{listing.description}\n\n"
+        f"💰 <b>Цена:</b> {listing.price} руб.\n"
+        f"👤 <b>Продавец:</b> @{listing.user_id}\n\n"
     )
     
     # Создаем клавиатуру
@@ -374,12 +431,12 @@ async def show_random_listing(message: types.Message):
     if not is_favorite:
         builder.add(types.InlineKeyboardButton(
             text="❤️ Добавить в избранное",
-            callback_data=f"fav_{id_}"
+            callback_data=f"fav_{listing.id}"
         ))
     else:
         builder.add(types.InlineKeyboardButton(
             text="💔 Удалить из избранного",
-            callback_data=f"unfav_{id_}"
+            callback_data=f"unfav_{listing.id}"
         ))
     
     builder.add(types.InlineKeyboardButton(
@@ -388,10 +445,9 @@ async def show_random_listing(message: types.Message):
     ))
     
     # Если есть фото, отправляем их
-    photos = eval(photos_str) if photos_str else []
-    if photos:
+    if listing.photos:
         media = []
-        for i, photo_id in enumerate(photos):
+        for i, photo_id in enumerate(listing.photos):
             media.append(types.InputMediaPhoto(
                 media=photo_id,
                 caption=response if i == 0 else None
@@ -404,105 +460,85 @@ async def show_random_listing(message: types.Message):
 
 @dp.callback_query(F.data == "next_listing")
 async def next_listing(callback: types.CallbackQuery):
-    await callback.message.delete()
+    try:
+        await callback.message.delete()
+    except:
+        pass
     await show_random_listing(callback.message)
 
 @dp.callback_query(F.data.startswith("fav_"))
 async def add_favorite(callback: types.CallbackQuery):
-    listing_id = int(callback.data.split('_')[1])
-    
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
+    listing_id = callback.data.split('_')[1]
     
     try:
-        cursor.execute('INSERT INTO favorites (user_id, listing_id) VALUES (?, ?)', 
-                      (callback.from_user.id, listing_id))
-        conn.commit()
+        storage.add_to_favorites(callback.from_user.id, listing_id)
         await callback.answer("❤️ Объявление добавлено в избранное!")
-    except sqlite3.IntegrityError:
-        await callback.answer("ℹ️ Это объявление уже в вашем избранном.")
-    finally:
-        conn.close()
-    
-    # Обновляем кнопки
-    builder = InlineKeyboardBuilder()
-    builder.add(
-        types.InlineKeyboardButton(
-            text="💔 Удалить из избранного",
-            callback_data=f"unfav_{listing_id}"
-        ),
-        types.InlineKeyboardButton(
-            text="➡️ Следующее объявление",
-            callback_data="next_listing"
+        
+        # Обновляем кнопки
+        builder = InlineKeyboardBuilder()
+        builder.add(
+            types.InlineKeyboardButton(
+                text="💔 Удалить из избранного",
+                callback_data=f"unfav_{listing_id}"
+            ),
+            types.InlineKeyboardButton(
+                text="➡️ Следующее объявление",
+                callback_data="next_listing"
+            )
         )
-    )
-    
-    try:
-        await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
-    except:
-        pass
+        
+        try:
+            await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+        except:
+            pass
+    except Exception as e:
+        await callback.answer(f"⚠️ Ошибка: {str(e)}")
 
 @dp.callback_query(F.data.startswith("unfav_"))
 async def remove_favorite(callback: types.CallbackQuery):
-    listing_id = int(callback.data.split('_')[1])
-    
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('DELETE FROM favorites WHERE user_id = ? AND listing_id = ?', 
-                  (callback.from_user.id, listing_id))
-    conn.commit()
-    conn.close()
-    
-    await callback.answer("💔 Объявление удалено из избранного")
-    
-    # Обновляем кнопки
-    builder = InlineKeyboardBuilder()
-    builder.add(
-        types.InlineKeyboardButton(
-            text="❤️ Добавить в избранное",
-            callback_data=f"fav_{listing_id}"
-        ),
-        types.InlineKeyboardButton(
-            text="➡️ Следующее объявление",
-            callback_data="next_listing"
-        )
-    )
+    listing_id = callback.data.split('_')[1]
     
     try:
-        await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
-    except:
-        pass
+        storage.remove_from_favorites(callback.from_user.id, listing_id)
+        await callback.answer("💔 Объявление удалено из избранного")
+        
+        # Обновляем кнопки
+        builder = InlineKeyboardBuilder()
+        builder.add(
+            types.InlineKeyboardButton(
+                text="❤️ Добавить в избранное",
+                callback_data=f"fav_{listing_id}"
+            ),
+            types.InlineKeyboardButton(
+                text="➡️ Следующее объявление",
+                callback_data="next_listing"
+            )
+        )
+        
+        try:
+            await callback.message.edit_reply_markup(reply_markup=builder.as_markup())
+        except:
+            pass
+    except Exception as e:
+        await callback.answer(f"⚠️ Ошибка: {str(e)}")
 
 # ================== МОИ АНКЕТЫ ==================
 
 @dp.message(F.text == "💼 Мои анкеты")
 async def handle_my(message: types.Message):
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
+    user_listings = storage.get_user_listings(message.from_user.id)
     
-    cursor.execute('''
-    SELECT id, title, description, price FROM listings 
-    WHERE user_id = ? AND is_active = 1
-    ORDER BY created_at DESC
-    ''', (message.from_user.id,))
-    
-    listings = cursor.fetchall()
-    conn.close()
-    
-    if not listings:
+    if not user_listings:
         await message.answer("📭 У вас пока нет активных анкет.")
         return
     
     response = ["📂 <b>Ваши анкеты</b>\n"]
-    for listing in listings:
-        id_, title, description, price = listing
+    for listing in user_listings:
         response.append(
-            f"\n🆔 <b>ID:</b> {id_}\n"
-            f"🏷 <b>Название:</b> {title}\n"
-            f"💰 <b>Цена:</b> {price} руб.\n"
-            f"📄 <b>Описание:</b> {description[:100]}...\n"
-            f"🔗 /view_{id_} - просмотреть полностью"
+            f"\n🆔 <b>ID:</b> {listing.id}\n"
+            f"🏷 <b>Название:</b> {listing.title}\n"
+            f"💰 <b>Цена:</b> {listing.price} руб.\n"
+            f"📄 <b>Описание:</b> {listing.description[:100]}...\n"
         )
     
     builder = InlineKeyboardBuilder()
@@ -518,76 +554,47 @@ async def delete_listing_prompt(callback: types.CallbackQuery):
 
 @dp.message(F.text.regexp(r'^\d+$'))
 async def delete_listing_by_id(message: types.Message):
-    listing_id = int(message.text)
+    listing_id = message.text
     
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
-    
-    # Проверяем, что пользователь является владельцем
-    cursor.execute('SELECT user_id FROM listings WHERE id = ?', (listing_id,))
-    listing = cursor.fetchone()
-    
-    if not listing or listing[0] != message.from_user.id:
-        await message.answer("⚠️ Вы не можете удалить это объявление")
-        conn.close()
-        return
-    
-    # Мягкое удаление
-    cursor.execute('UPDATE listings SET is_active = 0 WHERE id = ?', (listing_id,))
-    conn.commit()
-    conn.close()
-    
-    await message.answer("🗑 Объявление успешно удалено")
+    if storage.deactivate_listing(listing_id, message.from_user.id):
+        await message.answer("🗑 Объявление успешно удалено")
+    else:
+        await message.answer("⚠️ Вы не можете удалить это объявление или оно не найдено")
 
 # ================== ИЗБРАННЫЕ АНКЕТЫ ==================
 
 @dp.message(F.text == "♥️ Избранные анкеты")
 async def handle_likes(message: types.Message):
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
+    favorites = storage.get_favorites(message.from_user.id)
     
-    cursor.execute('''
-    SELECT l.id, l.title, l.description, l.price, l.photos, l.user_id 
-    FROM listings l
-    JOIN favorites f ON l.id = f.listing_id
-    WHERE f.user_id = ? AND l.is_active = 1
-    ORDER BY l.created_at DESC
-    ''', (message.from_user.id,))
-    
-    listings = cursor.fetchall()
-    conn.close()
-    
-    if not listings:
+    if not favorites:
         await message.answer("❤️ У вас пока нет избранных объявлений.")
         return
     
-    for listing in listings:
-        id_, title, description, price, photos_str, user_id = listing
-        photos = eval(photos_str) if photos_str else []
-        
+    for listing in favorites:
         response = (
             f"❤️ <b>Избранное</b>\n\n"
-            f"🏷 <b>Название:</b> {title}\n"
-            f"💰 <b>Цена:</b> {price} руб.\n"
-            f"👤 <b>Продавец:</b> @{user_id}\n"
-            f"📄 <b>Описание:</b>\n{description}\n\n"
+            f"🏷 <b>Название:</b> {listing.title}\n"
+            f"💰 <b>Цена:</b> {listing.price} руб.\n"
+            f"👤 <b>Продавец:</b> @{listing.user_id}\n"
+            f"📄 <b>Описание:</b>\n{listing.description}\n\n"
         )
         
         builder = InlineKeyboardBuilder()
         builder.add(
             types.InlineKeyboardButton(
                 text="💬 Написать продавцу",
-                url=f"tg://user?id={user_id}"
+                url=f"tg://user?id={listing.user_id}"
             ),
             types.InlineKeyboardButton(
                 text="💔 Удалить из избранного",
-                callback_data=f"unfav_{id_}"
+                callback_data=f"unfav_{listing.id}"
             )
         )
         
-        if photos:
+        if listing.photos:
             media = []
-            for i, photo_id in enumerate(photos):
+            for i, photo_id in enumerate(listing.photos):
                 media.append(types.InputMediaPhoto(
                     media=photo_id,
                     caption=response if i == 0 else None
