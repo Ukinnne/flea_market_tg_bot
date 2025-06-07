@@ -54,6 +54,15 @@ def init_db():
     )
     ''')
     
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS viewed_listings (
+        user_id INTEGER NOT NULL,
+        listing_id INTEGER NOT NULL,
+        viewed INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, listing_id)
+    )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -292,27 +301,58 @@ async def show_random_listing(message: types.Message):
     conn = sqlite3.connect('flea_market.db')
     cursor = conn.cursor()
     
-    # Получаем все активные объявления, кроме собственных
+    # Получаем все активные объявления, кроме собственных и уже просмотренных
     cursor.execute('''
-    SELECT id, title, description, price, photos, user_id 
-    FROM listings 
-    WHERE is_active = 1 AND user_id != ?
-    ''', (message.from_user.id,))
+    SELECT l.id, l.title, l.description, l.price, l.photos, l.user_id 
+    FROM listings l
+    LEFT JOIN viewed_listings vl ON l.id = vl.listing_id AND vl.user_id = ?
+    WHERE l.is_active = 1 
+    AND l.user_id != ?
+    AND (vl.viewed IS NULL OR vl.viewed = 0)
+    ''', (message.from_user.id, message.from_user.id))
     
-    listings = cursor.fetchall()
-    conn.close()
+    available_listings = cursor.fetchall()
     
-    if not listings:
-        await message.answer("🔍 Пока нет доступных объявлений. Попробуйте позже.")
-        return
+    if not available_listings:
+        # Если нет непросмотренных объявлений, сбрасываем статус просмотров
+        cursor.execute('''
+        UPDATE viewed_listings 
+        SET viewed = 0 
+        WHERE user_id = ?
+        ''', (message.from_user.id,))
+        conn.commit()
+        
+        # Повторно пытаемся получить объявления
+        cursor.execute('''
+        SELECT l.id, l.title, l.description, l.price, l.photos, l.user_id 
+        FROM listings l
+        LEFT JOIN viewed_listings vl ON l.id = vl.listing_id AND vl.user_id = ?
+        WHERE l.is_active = 1 
+        AND l.user_id != ?
+        AND (vl.viewed IS NULL OR vl.viewed = 0)
+        ''', (message.from_user.id, message.from_user.id))
+        
+        available_listings = cursor.fetchall()
+        
+        if not available_listings:
+            conn.close()
+            await message.answer("🔍 На данный момент нет новых объявлений. Попробуйте позже.")
+            return
+        else:
+            await message.answer("🔄 Вы просмотрели все объявления. Начинаем показ заново.")
     
-    # Выбираем случайное объявление
-    listing = random.choice(listings)
+    # Выбираем случайное объявление из доступных
+    listing = random.choice(available_listings)
     id_, title, description, price, photos_str, user_id = listing
     
+    # Помечаем объявление как просмотренное
+    cursor.execute('''
+    INSERT OR REPLACE INTO viewed_listings (user_id, listing_id, viewed)
+    VALUES (?, ?, 1)
+    ''', (message.from_user.id, id_))
+    conn.commit()
+    
     # Проверяем, есть ли уже это объявление в избранном
-    conn = sqlite3.connect('flea_market.db')
-    cursor = conn.cursor()
     cursor.execute('''
     SELECT 1 FROM favorites 
     WHERE user_id = ? AND listing_id = ?
